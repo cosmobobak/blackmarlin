@@ -398,10 +398,7 @@ impl Nnue {
         };
 
         let bucket = (((63 - piece_cnt) * (32 - piece_cnt)) / 225).min(7);
-
-        // layers::sq_clipped_relu(*stm.get(), &mut incr.0);
-        // layers::sq_clipped_relu(*nstm.get(), &mut incr.0[MID..]);
-
-        layers::scale_network_output(self.out_layer.feed_forward(stm.get(), nstm.get(), bucket))
+        let output = self.out_layer.feed_forward(stm.get(), nstm.get(), bucket);
+        layers::scale_network_output(output)
     }
 }
