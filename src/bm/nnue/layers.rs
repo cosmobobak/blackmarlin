@@ -1,7 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
-use cfg_if::cfg_if;
 use super::MID;
+use cfg_if::cfg_if;
 
 const UNITS: i16 = 400_i16;
 const FT_SCALE: i16 = 255;
@@ -86,7 +86,12 @@ impl<const OUTPUT: usize> Dense<OUTPUT> {
         Self { weights, bias }
     }
 
-    pub fn feed_forward(&self, stm: &Align<[i16; MID]>, nstm: &Align<[i16; MID]>, bucket: usize) -> i32 {
+    pub fn feed_forward(
+        &self,
+        stm: &Align<[i16; MID]>,
+        nstm: &Align<[i16; MID]>,
+        bucket: usize,
+    ) -> i32 {
         let weights = &self.weights[bucket];
 
         let out = flatten(stm, nstm, weights);
@@ -119,8 +124,8 @@ fn flatten(
 /// Non-SIMD implementation of the forward pass.
 #[cfg(not(target_feature = "avx2"))]
 mod generic {
-    use super::{Align, MAX};
     use super::super::MID as LAYER_1_SIZE;
+    use super::{Align, MAX};
 
     #[allow(clippy::cast_possible_truncation)]
     fn screlu(x: i16) -> i32 {
@@ -150,18 +155,22 @@ mod generic {
 /// SIMD implementation of the forward pass.
 #[cfg(target_feature = "avx2")]
 mod avx2 {
-    use super::{Align, MAX};
     use super::super::MID as LAYER_1_SIZE;
+    use super::{Align, MAX};
     use std::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_load_si256,
-        _mm256_madd_epi16, _mm256_max_epi16, _mm256_min_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
-        _mm256_setzero_si256, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_extracti128_si256,
+        _mm256_load_si256, _mm256_madd_epi16, _mm256_max_epi16, _mm256_min_epi16,
+        _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm_add_epi32,
+        _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
     };
 
     type Vec256 = __m256i;
 
     #[inline]
-    unsafe fn load_i16s<const VEC_SIZE: usize>(acc: &Align<[i16; VEC_SIZE]>, start_idx: usize) -> Vec256 {
+    unsafe fn load_i16s<const VEC_SIZE: usize>(
+        acc: &Align<[i16; VEC_SIZE]>,
+        start_idx: usize,
+    ) -> Vec256 {
         _mm256_load_si256(acc.0.as_ptr().add(start_idx).cast())
     }
 
@@ -232,12 +241,15 @@ mod avx2 {
 
 #[cfg(target_feature = "neon")]
 mod neon {
-    use super::{Align, MAX};
     use super::super::MID as LAYER_1_SIZE;
+    use super::{Align, MAX};
     use std::{arch::aarch64::*, mem::size_of_val};
 
     #[inline]
-    unsafe fn load_i16s<const VEC_SIZE: usize>(acc: &Align<[i16; VEC_SIZE]>, start_idx: usize) -> int16x8_t {
+    unsafe fn load_i16s<const VEC_SIZE: usize>(
+        acc: &Align<[i16; VEC_SIZE]>,
+        start_idx: usize,
+    ) -> int16x8_t {
         vld1q_s16(acc.0.as_ptr().add(start_idx).cast())
     }
 
