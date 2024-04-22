@@ -39,15 +39,15 @@ pub fn dense_from_bytes_i8<
     const OUTPUT: usize,
 >(
     bytes: &[u8],
-) -> Box<Align<[[T; INPUT]; OUTPUT]>> {
+) -> Box<[Align<[T; INPUT]>; OUTPUT]> {
     let mut weights = vec![];
     for &byte in bytes.iter().take(INPUT * OUTPUT) {
         weights.push(i8::from_le_bytes([byte]))
     }
-    let mut dense = Box::new(Align([[T::default(); INPUT]; OUTPUT]));
+    let mut dense = Box::new([Align([T::default(); INPUT]); OUTPUT]);
     for (i, weights) in weights.chunks(INPUT).enumerate() {
         for (j, &weight) in weights.iter().enumerate() {
-            dense.0[i][j] = T::from(weight);
+            dense[i].0[j] = T::from(weight);
         }
     }
     dense

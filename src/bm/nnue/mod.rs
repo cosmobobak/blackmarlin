@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrayvec::ArrayVec;
 use cozy_chess::{BitBoard, Board, Color, File, Move, Piece, Rank, Square};
 
-use self::layers::{Align, Dense, Incremental};
+use self::layers::{Dense, Incremental};
 
 use super::bm_runner::ab_runner;
 
@@ -110,7 +110,7 @@ pub struct Nnue {
     accumulator: Vec<Accumulator>,
     bias: Arc<[i16; MID]>,
     head: usize,
-    out_layer: Dense<{ MID * 2 }, OUTPUT>,
+    out_layer: Dense<OUTPUT>,
 
     w_add: ArrayVec<usize, 48>,
     b_add: ArrayVec<usize, 48>,
@@ -125,7 +125,7 @@ impl Nnue {
         bytes = &bytes[INPUT * MID * 2..];
         let incremental_bias = include::bias_from_bytes_i16::<i16, MID>(bytes);
         bytes = &bytes[MID * 2..];
-        let out = Arc::from(include::dense_from_bytes_i8::<i8, { MID * 2 }, OUTPUT>(
+        let out = Arc::from(include::dense_from_bytes_i8::<i16, { MID * 2 }, OUTPUT>(
             bytes,
         ));
         bytes = &bytes[MID * OUTPUT * 2..];
@@ -232,8 +232,8 @@ impl Nnue {
     fn push_accumulator(&mut self) {
         let w_out = *self.accumulator[self.head].w_input_layer.get();
         let b_out = *self.accumulator[self.head].b_input_layer.get();
-        self.accumulator[self.head + 1].w_input_layer.reset(w_out);
-        self.accumulator[self.head + 1].b_input_layer.reset(b_out);
+        self.accumulator[self.head + 1].w_input_layer.reset(w_out.0);
+        self.accumulator[self.head + 1].b_input_layer.reset(b_out.0);
         self.head += 1;
     }
 
@@ -391,15 +391,17 @@ impl Nnue {
 
     pub fn feed_forward(&mut self, stm: Color, piece_cnt: usize) -> i16 {
         let acc = &mut self.accumulator[self.head];
-        let mut incr = Align([0; MID * 2]);
+
         let (stm, nstm) = match stm {
             Color::White => (&acc.w_input_layer, &acc.b_input_layer),
             Color::Black => (&acc.b_input_layer, &acc.w_input_layer),
         };
-        layers::sq_clipped_relu(*stm.get(), &mut incr.0);
-        layers::sq_clipped_relu(*nstm.get(), &mut incr.0[MID..]);
 
         let bucket = (((63 - piece_cnt) * (32 - piece_cnt)) / 225).min(7);
-        layers::scale_network_output(self.out_layer.feed_forward(&incr, bucket))
+
+        // layers::sq_clipped_relu(*stm.get(), &mut incr.0);
+        // layers::sq_clipped_relu(*nstm.get(), &mut incr.0[MID..]);
+
+        layers::scale_network_output(self.out_layer.feed_forward(stm.get(), nstm.get(), bucket))
     }
 }

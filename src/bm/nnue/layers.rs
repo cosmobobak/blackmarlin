@@ -1,6 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
 use cfg_if::cfg_if;
+use super::MID;
 
 const UNITS: i16 = 400_i16;
 const FT_SCALE: i16 = 255;
@@ -59,74 +60,39 @@ impl<const INPUT: usize, const OUTPUT: usize> Incremental<INPUT, OUTPUT> {
         }
     }
 
-    pub fn get(&self) -> &[i16; OUTPUT] {
-        &self.out.0
+    pub fn get<'a>(&'a self) -> &'a Align<[i16; OUTPUT]> {
+        let slice = &self.out.0;
+        // SAFETY: The resulting slice is indeed OUTPUT long,
+        // and we check that the slice is aligned to 64 bytes.
+        // additionally, we're generating the reference from our own data,
+        // so we know that the lifetime is valid.
+        unsafe {
+            // don't immediately cast to Align64, as we want to check the alignment first.
+            let ptr = slice.as_ptr();
+            assert_eq!(ptr.align_offset(64), 0);
+            // alignments are sensible, so we can safely cast.
+            #[allow(clippy::cast_ptr_alignment)]
+            &*ptr.cast()
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Dense<const INPUT: usize, const OUTPUT: usize> {
-    weights: Arc<Align<[[i8; INPUT]; OUTPUT]>>,
+pub struct Dense<const OUTPUT: usize> {
+    weights: Arc<[Align<[i16; MID * 2]>; OUTPUT]>,
     bias: Align<[i32; OUTPUT]>,
 }
 
-impl<const INPUT: usize, const OUTPUT: usize> Dense<INPUT, OUTPUT> {
-    pub fn new(weights: Arc<Align<[[i8; INPUT]; OUTPUT]>>, bias: Align<[i32; OUTPUT]>) -> Self {
+impl<const OUTPUT: usize> Dense<OUTPUT> {
+    pub fn new(weights: Arc<[Align<[i16; MID * 2]>; OUTPUT]>, bias: Align<[i32; OUTPUT]>) -> Self {
         Self { weights, bias }
     }
 
-    pub fn feed_forward(&self, inputs: &Align<[u8; INPUT]>, bucket: usize) -> i32 {
-        let mut out = self.bias.0[bucket];
+    pub fn feed_forward(&self, stm: &Align<[i16; MID]>, nstm: &Align<[i16; MID]>, bucket: usize) -> i32 {
+        let weights = &self.weights[bucket];
 
-        #[cfg(target_feature = "avx2")]
-        {
-            use std::arch::x86_64::*;
-            const VEC_SIZE: usize = std::mem::size_of::<__m256i>() / std::mem::size_of::<u8>();
+        let out = flatten(stm, nstm, weights);
 
-            // SAFETY: Only enabled on AVX2
-            if INPUT % VEC_SIZE == 0 {
-                unsafe {
-                    let weights = &self.weights.0[bucket];
-                    let ones = _mm256_set1_epi16(1);
-                    let mut sum = _mm256_setzero_si256();
-                    for (inputs, weights) in inputs
-                        .0
-                        .chunks_exact(VEC_SIZE)
-                        .zip(weights.chunks_exact(VEC_SIZE))
-                    {
-                        // SAFETY: input and weights are exactly 256 bits due to chunks_exact.
-                        // input and weights are from Align<T> types, which are guaranteed to be aligned.
-                        let inputs = _mm256_load_si256(inputs.as_ptr() as *const _);
-                        let weights = _mm256_load_si256(weights.as_ptr() as *const _);
-                        // u8x32 * i8x32 -> i16x32 horizontal add -> i16x16
-                        let partial = _mm256_maddubs_epi16(inputs, weights);
-                        // i16x16 * i16x16 -> i32x16 horizontal add -> i32x8
-                        // We only want the horizontal add, so we no-op multiply with a vector of all ones.
-                        let partial = _mm256_madd_epi16(partial, ones);
-                        // i32x8 + i32x8 -> i32x8
-                        sum = _mm256_add_epi32(sum, partial);
-                    }
-
-                    // Sum i32x8 to i32.
-                    // i32x8 lower half -> i32x4
-                    let lower = _mm256_castsi256_si128(sum);
-                    // i32x8 upper half -> i32x4
-                    let upper = _mm256_extracti128_si256::<1>(sum);
-                    // i32x4 + i32x4 -> i32x4
-                    let sum = _mm_add_epi32(lower, upper);
-                    // i32x4 reversed -> i32x4
-                    let reversed = _mm_shuffle_epi32(sum, 0b_00_01_10_11);
-                    // i32x4 + i32x4 reversed -> i32x2 + ...
-                    let sum = _mm_add_epi32(sum, reversed);
-                    // i32x2 + ... element 0 -> i32
-                    let lower = _mm_cvtsi128_si32(sum);
-                    // i32x2 + ... element 1 -> i32
-                    let upper = _mm_extract_epi32::<1>(sum);
-                    out += lower + upper;
-                    return out;
-                }
-            }
-        }
         #[cfg(target_feature = "neon")]
         {
             use std::arch::aarch64::*;
@@ -163,11 +129,7 @@ impl<const INPUT: usize, const OUTPUT: usize> Dense<INPUT, OUTPUT> {
             }
         }
 
-        let weights = &self.weights.0[bucket];
-        for (&input, &weight) in inputs.0.iter().zip(weights) {
-            out += weight as i32 * input as i32;
-        }
-        out
+        out + self.bias.0[bucket]
     }
 }
 
@@ -175,21 +137,129 @@ pub fn scale_network_output(x: i32) -> i16 {
     (x as i32 * UNITS as i32 / (FT_SCALE as i32 * SCALE as i32)) as i16
 }
 
-pub fn sq_clipped_relu<const N: usize>(array: [i16; N], out: &mut [u8]) {
-    cfg_if! {
-        if #[cfg(target_feature = "neon")]
-        {
-            for (array, out) in array.chunks(256).zip(out.chunks_mut(256)) {
-                for (&x, clipped) in array.iter().zip(out.iter_mut()) {
-                    let tmp = x.max(MIN).min(MAX) as u16;
-                    *clipped = ((tmp * tmp) >> SHIFT) as u8;
-                }
-            }
-        } else {
-            for (&x, clipped) in array.iter().zip(out.iter_mut()) {
-                let tmp = x.max(MIN).min(MAX) as u16;
-                *clipped = ((tmp * tmp) >> SHIFT) as u8;
-            }
+fn flatten(
+    us: &Align<[i16; MID]>,
+    them: &Align<[i16; MID]>,
+    weights: &Align<[i16; MID * 2]>,
+) -> i32 {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        avx2::flatten(us, them, weights)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        generic::flatten(us, them, weights)
+    }
+}
+
+/// Non-SIMD implementation of the forward pass.
+#[cfg(not(target_feature = "avx2"))]
+mod generic {
+    use super::{Align, MAX};
+    use super::super::MID as LAYER_1_SIZE;
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn screlu(x: i16) -> i32 {
+        let x = x.clamp(0, MAX);
+        let x = i32::from(x);
+        x * x
+    }
+
+    /// Execute an activation on the partial activations,
+    /// and accumulate the result into a sum.
+    pub fn flatten(
+        us: &Align<[i16; LAYER_1_SIZE]>,
+        them: &Align<[i16; LAYER_1_SIZE]>,
+        weights: &Align<[i16; LAYER_1_SIZE * 2]>,
+    ) -> i32 {
+        let mut sum: i32 = 0;
+        for (&i, &w) in us.iter().zip(&weights[..LAYER_1_SIZE]) {
+            sum += screlu(i) * i32::from(w);
         }
+        for (&i, &w) in them.iter().zip(&weights[LAYER_1_SIZE..]) {
+            sum += screlu(i) * i32::from(w);
+        }
+        sum / MAX as i32
+    }
+}
+
+/// SIMD implementation of the forward pass.
+#[cfg(target_feature = "avx2")]
+mod avx2 {
+    use super::{Align, MAX};
+    use super::super::MID as LAYER_1_SIZE;
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_load_si256,
+        _mm256_madd_epi16, _mm256_max_epi16, _mm256_min_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
+        _mm256_setzero_si256, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+    };
+
+    type Vec256 = __m256i;
+
+    #[inline]
+    unsafe fn load_i16s<const VEC_SIZE: usize>(acc: &Align<[i16; VEC_SIZE]>, start_idx: usize) -> Vec256 {
+        _mm256_load_si256(acc.0.as_ptr().add(start_idx).cast())
+    }
+
+    #[inline]
+    unsafe fn horizontal_sum_i32(sum: Vec256) -> i32 {
+        let upper_128 = _mm256_extracti128_si256::<1>(sum);
+        let lower_128 = _mm256_castsi256_si128(sum);
+        let sum_128 = _mm_add_epi32(upper_128, lower_128);
+        let upper_64 = _mm_unpackhi_epi64(sum_128, sum_128);
+        let sum_64 = _mm_add_epi32(upper_64, sum_128);
+        let upper_32 = _mm_shuffle_epi32::<0b00_00_00_01>(sum_64);
+        let sum_32 = _mm_add_epi32(upper_32, sum_64);
+
+        _mm_cvtsi128_si32(sum_32)
+    }
+
+    /// Execute an activation on the partial activations,
+    /// and accumulate the result into a sum.
+    pub unsafe fn flatten(
+        us: &Align<[i16; LAYER_1_SIZE]>,
+        them: &Align<[i16; LAYER_1_SIZE]>,
+        weights: &Align<[i16; LAYER_1_SIZE * 2]>,
+    ) -> i32 {
+        const CHUNK: usize = 16;
+
+        let mut sum = _mm256_setzero_si256();
+        let min = _mm256_setzero_si256();
+        let max = _mm256_set1_epi16(MAX as i16);
+
+        // the following code uses a trick devised by the author of the Lizard chess engine.
+        // we're implementing the function f(x) = clamp(x, 0, MAX)^2 * w,
+        // and we do this in the following manner:
+        // 1. load the input, x
+        // 2. compute v := clamp(x, 0, MAX)
+        // 3. load the weight, w
+        // 4. compute t := v * w via truncating 16-bit multiply.
+        //    this step relies on our invariant that v * w fits in i16.
+        // 5. compute product := v * t via horizontally accumulating
+        //    expand-to-i32 multiply.
+        // 6. add product to the running sum.
+        // at this point we've computed clamp(x, 0, MAX)^2 * w
+        // by doing (clamp(x, 0, MAX) * w) * clamp(x, 0, MAX).
+        // the clever part is step #4, which the compiler cannot know to do.
+
+        // accumulate the first half of the weights
+        for i in 0..LAYER_1_SIZE / CHUNK {
+            let x = load_i16s(us, i * CHUNK);
+            let v = _mm256_min_epi16(_mm256_max_epi16(x, min), max);
+            let w = load_i16s(weights, i * CHUNK);
+            let product = _mm256_madd_epi16(v, _mm256_mullo_epi16(v, w));
+            sum = _mm256_add_epi32(sum, product);
+        }
+
+        // accumulate the second half of the weights
+        for i in 0..LAYER_1_SIZE / CHUNK {
+            let x = load_i16s(them, i * CHUNK);
+            let v = _mm256_min_epi16(_mm256_max_epi16(x, min), max);
+            let w = load_i16s(weights, LAYER_1_SIZE + i * CHUNK);
+            let product = _mm256_madd_epi16(v, _mm256_mullo_epi16(v, w));
+            sum = _mm256_add_epi32(sum, product);
+        }
+
+        horizontal_sum_i32(sum) / MAX as i32
     }
 }
